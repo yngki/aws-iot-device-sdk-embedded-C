@@ -1,5 +1,5 @@
 /*
- * AWS IoT Device SDK for Embedded C V202009.00
+ * AWS IoT Device SDK for Embedded C 202103.00
  * Copyright (C) 2020 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
@@ -37,7 +37,7 @@
  * 2. Define CLIENT_USERNAME and CLIENT_PASSWORD in demo_config.h for client
  *    authentication to be done using a username and password. More details about
  *    this client authentication can be found in the link below.
- *    https://docs.aws.amazon.com/iot/latest/developerguide/enhanced-custom-authentication.html
+ *    https://docs.aws.amazon.com/iot/latest/developerguide/custom-authentication.html
  *    An authorizer setup needs to be done, as mentioned in the above link, to use
  *    username/password based client authentication.
  *
@@ -54,6 +54,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* POSIX includes. */
 #include <unistd.h>
@@ -68,8 +69,8 @@
 /* OpenSSL sockets transport implementation. */
 #include "openssl_posix.h"
 
-/* Retry parameters. */
-#include "retry_utils.h"
+/*Include backoff algorithm header for retry logic.*/
+#include "backoff_algorithm.h"
 
 /* Clock for timer. */
 #include "clock.h"
@@ -138,12 +139,12 @@
 /**
  * @brief Length of MQTT server host name.
  */
-#define AWS_IOT_ENDPOINT_LENGTH             ( ( uint16_t ) ( sizeof( AWS_IOT_ENDPOINT ) - 1 ) )
+#define AWS_IOT_ENDPOINT_LENGTH         ( ( uint16_t ) ( sizeof( AWS_IOT_ENDPOINT ) - 1 ) )
 
 /**
  * @brief Length of client identifier.
  */
-#define CLIENT_IDENTIFIER_LENGTH            ( ( uint16_t ) ( sizeof( CLIENT_IDENTIFIER ) - 1 ) )
+#define CLIENT_IDENTIFIER_LENGTH        ( ( uint16_t ) ( sizeof( CLIENT_IDENTIFIER ) - 1 ) )
 
 /**
  * @brief ALPN (Application-Layer Protocol Negotiation) protocol name for AWS IoT MQTT.
@@ -153,28 +154,45 @@
  * in the link below.
  * https://aws.amazon.com/blogs/iot/mqtt-with-tls-client-authentication-on-port-443-why-it-is-useful-and-how-it-works/
  */
-#define AWS_IOT_MQTT_ALPN                   "\x0ex-amzn-mqtt-ca"
+#define AWS_IOT_MQTT_ALPN               "\x0ex-amzn-mqtt-ca"
 
 /**
  * @brief Length of ALPN protocol name.
  */
-#define AWS_IOT_MQTT_ALPN_LENGTH            ( ( uint16_t ) ( sizeof( AWS_IOT_MQTT_ALPN ) - 1 ) )
+#define AWS_IOT_MQTT_ALPN_LENGTH        ( ( uint16_t ) ( sizeof( AWS_IOT_MQTT_ALPN ) - 1 ) )
 
 /**
  * @brief This is the ALPN (Application-Layer Protocol Negotiation) string
  * required by AWS IoT for password-based authentication using TCP port 443.
  */
-#define AWS_IOT_PASSWORD_ALPN               "\x04mqtt"
+#define AWS_IOT_PASSWORD_ALPN           "\x04mqtt"
 
 /**
  * @brief Length of password ALPN.
  */
-#define AWS_IOT_PASSWORD_ALPN_LENGTH        ( ( uint16_t ) ( sizeof( AWS_IOT_PASSWORD_ALPN ) - 1 ) )
+#define AWS_IOT_PASSWORD_ALPN_LENGTH    ( ( uint16_t ) ( sizeof( AWS_IOT_PASSWORD_ALPN ) - 1 ) )
+
+
+/**
+ * @brief The maximum number of retries for connecting to server.
+ */
+#define CONNECTION_RETRY_MAX_ATTEMPTS            ( 5U )
+
+/**
+ * @brief The maximum back-off delay (in milliseconds) for retrying connection to server.
+ */
+#define CONNECTION_RETRY_MAX_BACKOFF_DELAY_MS    ( 5000U )
+
+/**
+ * @brief The base back-off delay (in milliseconds) to use for connection retry attempts.
+ */
+#define CONNECTION_RETRY_BACKOFF_BASE_MS         ( 500U )
 
 /**
  * @brief Timeout for receiving CONNACK packet in milli seconds.
  */
-#define CONNACK_RECV_TIMEOUT_MS             ( 1000U )
+#define CONNACK_RECV_TIMEOUT_MS                  ( 1000U )
+
 
 /**
  * @brief The topic to subscribe and publish to in the example.
@@ -245,7 +263,7 @@
 /**
  * @brief Transport timeout in milliseconds for transport send and receive.
  */
-#define TRANSPORT_SEND_RECV_TIMEOUT_MS      ( 100 )
+#define TRANSPORT_SEND_RECV_TIMEOUT_MS      ( 500 )
 
 /**
  * @brief The MQTT metrics string expected by AWS IoT.
@@ -330,6 +348,22 @@ static MQTTSubAckStatus_t globalSubAckStatus = MQTTSubAckFailure;
 
 /*-----------------------------------------------------------*/
 
+/* Each compilation unit must define the NetworkContext struct. */
+struct NetworkContext
+{
+    OpensslParams_t * pParams;
+};
+
+/*-----------------------------------------------------------*/
+
+/**
+ * @brief The random number generator to use for exponential backoff with
+ * jitter retry logic.
+ *
+ * @return The generated random number.
+ */
+static uint32_t generateRandomNumber();
+
 /**
  * @brief Connect to MQTT broker with reconnection retries.
  *
@@ -338,10 +372,18 @@ static MQTTSubAckStatus_t globalSubAckStatus = MQTTSubAckFailure;
  * timeout value is reached or the number of attempts are exhausted.
  *
  * @param[out] pNetworkContext The output parameter to return the created network context.
+ * @param[in] pMqttContext MQTT context pointer.
+ * @param[in,out] pClientSessionPresent Pointer to flag indicating if an
+ * MQTT session is present in the client.
+ * @param[out] pBrokerSessionPresent Session was already present in the broker or not.
+ * Session present response is obtained from the CONNACK from broker.
  *
  * @return EXIT_FAILURE on failure; EXIT_SUCCESS on successful connection.
  */
-static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext );
+static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext,
+                                              MQTTContext_t * pMqttContext,
+                                              bool * pClientSessionPresent,
+                                              bool * pBrokerSessionPresent );
 
 /**
  * @brief A function that connects to MQTT broker,
@@ -350,13 +392,10 @@ static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext
  * receives the Publish message back.
  *
  * @param[in] pMqttContext MQTT context pointer.
- * @param[in,out] pClientSessionPresent Pointer to flag indicating if an
- * MQTT session is present in the client.
  *
  * @return EXIT_FAILURE on failure; EXIT_SUCCESS on success.
  */
-static int subscribePublishLoop( MQTTContext_t * pMqttContext,
-                                 bool * pClientSessionPresent );
+static int subscribePublishLoop( MQTTContext_t * pMqttContext );
 
 /**
  * @brief The function to handle the incoming publishes.
@@ -513,14 +552,25 @@ static int handleResubscribe( MQTTContext_t * pMqttContext );
 
 /*-----------------------------------------------------------*/
 
-static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext )
+static uint32_t generateRandomNumber()
 {
-    int returnStatus = EXIT_SUCCESS;
-    RetryUtilsStatus_t retryUtilsStatus = RetryUtilsSuccess;
+    return( rand() );
+}
+
+/*-----------------------------------------------------------*/
+static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext,
+                                              MQTTContext_t * pMqttContext,
+                                              bool * pClientSessionPresent,
+                                              bool * pBrokerSessionPresent )
+{
+    int returnStatus = EXIT_FAILURE;
+    BackoffAlgorithmStatus_t backoffAlgStatus = BackoffAlgorithmSuccess;
     OpensslStatus_t opensslStatus = OPENSSL_SUCCESS;
-    RetryUtilsParams_t reconnectParams;
+    BackoffAlgorithmContext_t reconnectParams;
     ServerInfo_t serverInfo;
     OpensslCredentials_t opensslCredentials;
+    uint16_t nextRetryBackOff;
+    bool createCleanSession;
 
     /* Initialize information to connect to the MQTT broker. */
     serverInfo.pHostName = AWS_IOT_ENDPOINT;
@@ -555,7 +605,7 @@ static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext
          * For username and password based authentication in AWS IoT,
          * #AWS_IOT_PASSWORD_ALPN is used. More details can be found in the
          * link below.
-         * https://docs.aws.amazon.com/iot/latest/developerguide/enhanced-custom-auth-using.html
+         * https://docs.aws.amazon.com/iot/latest/developerguide/custom-authentication.html
          */
         #ifdef CLIENT_USERNAME
             opensslCredentials.pAlpnProtos = AWS_IOT_PASSWORD_ALPN;
@@ -567,7 +617,10 @@ static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext
     }
 
     /* Initialize reconnect attempts and interval */
-    RetryUtils_ParamsReset( &reconnectParams );
+    BackoffAlgorithm_InitializeParams( &reconnectParams,
+                                       CONNECTION_RETRY_BACKOFF_BASE_MS,
+                                       CONNECTION_RETRY_MAX_BACKOFF_DELAY_MS,
+                                       CONNECTION_RETRY_MAX_ATTEMPTS );
 
     /* Attempt to connect to MQTT broker. If connection fails, retry after
      * a timeout. Timeout value will exponentially increase until maximum
@@ -588,18 +641,46 @@ static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext
                                          TRANSPORT_SEND_RECV_TIMEOUT_MS,
                                          TRANSPORT_SEND_RECV_TIMEOUT_MS );
 
-        if( opensslStatus != OPENSSL_SUCCESS )
+        if( opensslStatus == OPENSSL_SUCCESS )
         {
-            LogWarn( ( "Connection to the broker failed. Retrying connection with backoff and jitter." ) );
-            retryUtilsStatus = RetryUtils_BackoffAndSleep( &reconnectParams );
+            /* A clean MQTT session needs to be created, if there is no session saved
+             * in this MQTT client. */
+            createCleanSession = ( *pClientSessionPresent == true ) ? false : true;
+
+            /* Sends an MQTT Connect packet using the established TLS session,
+             * then waits for connection acknowledgment (CONNACK) packet. */
+            returnStatus = establishMqttSession( pMqttContext, createCleanSession, pBrokerSessionPresent );
+
+            if( returnStatus == EXIT_FAILURE )
+            {
+                /* End TLS session, then close TCP connection. */
+                ( void ) Openssl_Disconnect( pNetworkContext );
+            }
+            else
+            {
+                *pClientSessionPresent = true;
+            }
         }
 
-        if( retryUtilsStatus == RetryUtilsRetriesExhausted )
+        if( returnStatus == EXIT_FAILURE )
         {
-            LogError( ( "Connection to the broker failed, all attempts exhausted." ) );
-            returnStatus = EXIT_FAILURE;
+            /* Generate a random number and get back-off value (in milliseconds) for the next connection retry. */
+            backoffAlgStatus = BackoffAlgorithm_GetNextBackoff( &reconnectParams, generateRandomNumber(), &nextRetryBackOff );
+
+            if( backoffAlgStatus == BackoffAlgorithmRetriesExhausted )
+            {
+                LogError( ( "Connection to the broker failed, all attempts exhausted." ) );
+                returnStatus = EXIT_FAILURE;
+            }
+            else if( backoffAlgStatus == BackoffAlgorithmSuccess )
+            {
+                LogWarn( ( "Connection to the broker failed. Retrying connection "
+                           "after %hu ms backoff.",
+                           ( unsigned short ) nextRetryBackOff ) );
+                Clock_SleepMs( nextRetryBackOff );
+            }
         }
-    } while( ( opensslStatus != OPENSSL_SUCCESS ) && ( retryUtilsStatus == RetryUtilsSuccess ) );
+    } while( ( returnStatus == EXIT_FAILURE ) && ( backoffAlgStatus == BackoffAlgorithmSuccess ) );
 
     return returnStatus;
 }
@@ -809,13 +890,17 @@ static int handleResubscribe( MQTTContext_t * pMqttContext )
 {
     int returnStatus = EXIT_SUCCESS;
     MQTTStatus_t mqttStatus = MQTTSuccess;
-    RetryUtilsStatus_t retryUtilsStatus = RetryUtilsSuccess;
-    RetryUtilsParams_t retryParams;
+    BackoffAlgorithmStatus_t backoffAlgStatus = BackoffAlgorithmSuccess;
+    BackoffAlgorithmContext_t retryParams;
+    uint16_t nextRetryBackOff = 0U;
 
     assert( pMqttContext != NULL );
 
     /* Initialize retry attempts and interval. */
-    RetryUtils_ParamsReset( &retryParams );
+    BackoffAlgorithm_InitializeParams( &retryParams,
+                                       CONNECTION_RETRY_BACKOFF_BASE_MS,
+                                       CONNECTION_RETRY_MAX_BACKOFF_DELAY_MS,
+                                       CONNECTION_RETRY_MAX_ATTEMPTS );
 
     do
     {
@@ -857,16 +942,23 @@ static int handleResubscribe( MQTTContext_t * pMqttContext )
          * server rejection of the subscription request. */
         if( globalSubAckStatus == MQTTSubAckFailure )
         {
-            LogWarn( ( "Server rejected subscription request. Retrying subscribe with backoff and jitter." ) );
-            retryUtilsStatus = RetryUtils_BackoffAndSleep( &retryParams );
-        }
+            /* Generate a random number and get back-off value (in milliseconds) for the next re-subscribe attempt. */
+            backoffAlgStatus = BackoffAlgorithm_GetNextBackoff( &retryParams, generateRandomNumber(), &nextRetryBackOff );
 
-        if( retryUtilsStatus == RetryUtilsRetriesExhausted )
-        {
-            LogError( ( "Subscription to topic failed, all attempts exhausted." ) );
-            returnStatus = EXIT_FAILURE;
+            if( backoffAlgStatus == BackoffAlgorithmRetriesExhausted )
+            {
+                LogError( ( "Subscription to topic failed, all attempts exhausted." ) );
+                returnStatus = EXIT_FAILURE;
+            }
+            else if( backoffAlgStatus == BackoffAlgorithmSuccess )
+            {
+                LogWarn( ( "Server rejected subscription request. Retrying "
+                           "connection after %hu ms backoff.",
+                           ( unsigned short ) nextRetryBackOff ) );
+                Clock_SleepMs( nextRetryBackOff );
+            }
         }
-    } while( ( globalSubAckStatus == MQTTSubAckFailure ) && ( retryUtilsStatus == RetryUtilsSuccess ) );
+    } while( ( globalSubAckStatus == MQTTSubAckFailure ) && ( backoffAlgStatus == BackoffAlgorithmSuccess ) );
 
     return returnStatus;
 }
@@ -994,7 +1086,7 @@ static int establishMqttSession( MQTTContext_t * pMqttContext,
     /* Use the username and password for authentication, if they are defined.
      * Refer to the AWS IoT documentation below for details regarding client
      * authentication with a username and password.
-     * https://docs.aws.amazon.com/iot/latest/developerguide/enhanced-custom-authentication.html
+     * https://docs.aws.amazon.com/iot/latest/developerguide/custom-authentication.html
      * An authorizer setup needs to be done, as mentioned in the above link, to use
      * username/password based client authentication.
      *
@@ -1242,65 +1334,14 @@ static int initializeMqtt( MQTTContext_t * pMqttContext,
 
 /*-----------------------------------------------------------*/
 
-static int subscribePublishLoop( MQTTContext_t * pMqttContext,
-                                 bool * pClientSessionPresent )
+static int subscribePublishLoop( MQTTContext_t * pMqttContext )
 {
     int returnStatus = EXIT_SUCCESS;
-    bool mqttSessionEstablished = false, brokerSessionPresent;
     MQTTStatus_t mqttStatus = MQTTSuccess;
     uint32_t publishCount = 0;
     const uint32_t maxPublishCount = MQTT_PUBLISH_COUNT_PER_LOOP;
-    bool createCleanSession = false;
 
     assert( pMqttContext != NULL );
-    assert( pClientSessionPresent != NULL );
-
-    /* A clean MQTT session needs to be created, if there is no session saved
-     * in this MQTT client. */
-    createCleanSession = ( *pClientSessionPresent == true ) ? false : true;
-
-    /* Establish MQTT session on top of TCP+TLS connection. */
-    LogInfo( ( "Creating an MQTT connection to %.*s.",
-               AWS_IOT_ENDPOINT_LENGTH,
-               AWS_IOT_ENDPOINT ) );
-
-    /* Sends an MQTT Connect packet using the established TLS session,
-     * then waits for connection acknowledgment (CONNACK) packet. */
-    returnStatus = establishMqttSession( pMqttContext, createCleanSession, &brokerSessionPresent );
-
-    if( returnStatus == EXIT_SUCCESS )
-    {
-        /* Keep a flag for indicating if MQTT session is established. This
-         * flag will mark that an MQTT DISCONNECT has to be sent at the end
-         * of the demo, even if there are intermediate failures. */
-        mqttSessionEstablished = true;
-
-        /* Update the flag to indicate that an MQTT client session is saved.
-         * Once this flag is set, MQTT connect in the following iterations of
-         * this demo will be attempted without requesting for a clean session. */
-        *pClientSessionPresent = true;
-
-        /* Check if session is present and if there are any outgoing publishes
-         * that need to resend. This is only valid if the broker is
-         * re-establishing a session which was already present. */
-        if( brokerSessionPresent == true )
-        {
-            LogInfo( ( "An MQTT session with broker is re-established. "
-                       "Resending unacked publishes." ) );
-
-            /* Handle all the resend of publish messages. */
-            returnStatus = handlePublishResend( pMqttContext );
-        }
-        else
-        {
-            LogInfo( ( "A clean MQTT connection is established."
-                       " Cleaning up all the stored outgoing publishes.\n\n" ) );
-
-            /* Clean up the outgoing publishes waiting for ack as this new
-             * connection doesn't re-establish an existing session. */
-            cleanupOutgoingPublishes();
-        }
-    }
 
     if( returnStatus == EXIT_SUCCESS )
     {
@@ -1409,22 +1450,19 @@ static int subscribePublishLoop( MQTTContext_t * pMqttContext,
     /* Send an MQTT Disconnect packet over the already connected TCP socket.
      * There is no corresponding response for the disconnect packet. After sending
      * disconnect, client must close the network connection. */
-    if( mqttSessionEstablished == true )
-    {
-        LogInfo( ( "Disconnecting the MQTT connection with %.*s.",
-                   AWS_IOT_ENDPOINT_LENGTH,
-                   AWS_IOT_ENDPOINT ) );
+    LogInfo( ( "Disconnecting the MQTT connection with %.*s.",
+               AWS_IOT_ENDPOINT_LENGTH,
+               AWS_IOT_ENDPOINT ) );
 
-        if( returnStatus == EXIT_FAILURE )
-        {
-            /* Returned status is not used to update the local status as there
-             * were failures in demo execution. */
-            ( void ) disconnectMqttSession( pMqttContext );
-        }
-        else
-        {
-            returnStatus = disconnectMqttSession( pMqttContext );
-        }
+    if( returnStatus == EXIT_FAILURE )
+    {
+        /* Returned status is not used to update the local status as there
+         * were failures in demo execution. */
+        ( void ) disconnectMqttSession( pMqttContext );
+    }
+    else
+    {
+        returnStatus = disconnectMqttSession( pMqttContext );
     }
 
     /* Reset global SUBACK status variable after completion of subscription request cycle. */
@@ -1455,10 +1493,23 @@ int main( int argc,
     int returnStatus = EXIT_SUCCESS;
     MQTTContext_t mqttContext = { 0 };
     NetworkContext_t networkContext = { 0 };
-    bool clientSessionPresent = false;
+    OpensslParams_t opensslParams = { 0 };
+    bool clientSessionPresent = false, brokerSessionPresent = false;
+    struct timespec tp;
 
     ( void ) argc;
     ( void ) argv;
+
+    /* Set the pParams member of the network context with desired transport. */
+    networkContext.pParams = &opensslParams;
+
+    /* Seed pseudo random number generator (provided by ISO C standard library) for
+     * use by retry utils library when retrying failed network operations. */
+
+    /* Get current time to seed pseudo random number generator. */
+    ( void ) clock_gettime( CLOCK_REALTIME, &tp );
+    /* Seed pseudo random number generator with nanoseconds. */
+    srand( tp.tv_nsec );
 
     /* Initialize MQTT library. Initialization of the MQTT library needs to be
      * done only once in this demo. */
@@ -1473,7 +1524,7 @@ int main( int argc,
              * attempts are reached or maximum timeout value is reached. The function
              * returns EXIT_FAILURE if the TCP connection cannot be established to
              * broker after configured number of attempts. */
-            returnStatus = connectToServerWithBackoffRetries( &networkContext );
+            returnStatus = connectToServerWithBackoffRetries( &networkContext, &mqttContext, &clientSessionPresent, &brokerSessionPresent );
 
             if( returnStatus == EXIT_FAILURE )
             {
@@ -1485,8 +1536,29 @@ int main( int argc,
             }
             else
             {
+                /* Check if session is present and if there are any outgoing publishes
+                 * that need to resend. This is only valid if the broker is
+                 * re-establishing a session which was already present. */
+                if( brokerSessionPresent == true )
+                {
+                    LogInfo( ( "An MQTT session with broker is re-established. "
+                               "Resending unacked publishes." ) );
+
+                    /* Handle all the resend of publish messages. */
+                    returnStatus = handlePublishResend( &mqttContext );
+                }
+                else
+                {
+                    LogInfo( ( "A clean MQTT connection is established."
+                               " Cleaning up all the stored outgoing publishes.\n\n" ) );
+
+                    /* Clean up the outgoing publishes waiting for ack as this new
+                     * connection doesn't re-establish an existing session. */
+                    cleanupOutgoingPublishes();
+                }
+
                 /* If TLS session is established, execute Subscribe/Publish loop. */
-                returnStatus = subscribePublishLoop( &mqttContext, &clientSessionPresent );
+                returnStatus = subscribePublishLoop( &mqttContext );
             }
 
             if( returnStatus == EXIT_SUCCESS )
